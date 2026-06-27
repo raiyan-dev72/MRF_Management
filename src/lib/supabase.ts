@@ -12,17 +12,12 @@ export const supabase = isSupabaseConfigured
   ? createClient(supabaseUrl!, supabaseAnonKey!)
   : null;
 
-export async function sendMagicLink(email: string) {
+export async function signInWithPassword(email: string, password: string) {
   if (!supabase) {
     return { error: { message: 'Supabase is not configured. Add project URL and anon key in .env.' } };
   }
 
-  return supabase.auth.signInWithOtp({
-    email,
-    options: {
-      emailRedirectTo: window.location.origin,
-    },
-  });
+  return supabase.auth.signInWithPassword({ email, password });
 }
 
 export async function uploadDocument(file: File, folderPath: string) {

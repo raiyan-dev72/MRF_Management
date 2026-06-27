@@ -46,11 +46,11 @@ import {
   YAxis,
 } from 'recharts';
 import './styles.css';
-import { drivers, materials, sites, today } from './data/seed';
+import { drivers, materials, seedState, sites, today } from './data/seed';
 import { emptyState, loadAppState, persistStateChanges } from './lib/database';
 import { exportToExcel, exportToPdf } from './lib/exporters';
 import { createId } from './lib/storage';
-import { isSupabaseConfigured, sendMagicLink, supabase, uploadDocument } from './lib/supabase';
+import { isSupabaseConfigured, signInWithPassword, supabase, uploadDocument } from './lib/supabase';
 import {
   AccentureEntry,
   AppState,
@@ -219,21 +219,25 @@ function deleteFromList<T extends { id: string }>(rows: T[], id: string) {
   return rows.filter((row) => row.id !== id);
 }
 
+const DEMO_USER_EMAIL = 'demo@earthrecycler.local';
+
 function Login({ onLogin }: { onLogin: (email: string) => void }) {
   const [email, setEmail] = React.useState('');
+  const [password, setPassword] = React.useState('');
   const [message, setMessage] = React.useState('');
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!email.trim()) return;
+    if (!email.trim() || !password) return;
 
-    const result = await sendMagicLink(email.trim());
+    const result = await signInWithPassword(email.trim(), password);
     if (result.error) {
       setMessage(result.error.message);
       return;
     }
 
-    setMessage('Login link sent. Check your email to continue.');
+    setMessage('');
+    onLogin(result.data?.user?.email ?? email.trim());
   }
 
   return (
@@ -257,7 +261,7 @@ function Login({ onLogin }: { onLogin: (email: string) => void }) {
 
       <form className="login-card" onSubmit={submit}>
         <h2>Supervisor Login</h2>
-        <p>Enter the registered email address for your MRF team.</p>
+        <p>Enter your email address and password to continue.</p>
         <label>
           Email address
           <input
@@ -267,13 +271,31 @@ function Login({ onLogin }: { onLogin: (email: string) => void }) {
             onChange={(event) => setEmail(event.target.value)}
           />
         </label>
+        <label>
+          Password
+          <input
+            type="password"
+            value={password}
+            placeholder="Enter your password"
+            onChange={(event) => setPassword(event.target.value)}
+          />
+        </label>
         <button className="primary-button" type="submit">
-          Continue with Email
+          Sign In
         </button>
         {!isSupabaseConfigured && (
-          <p className="helper-text">
-            Supabase is required for production data. Add keys in `.env` to enable login.
-          </p>
+          <>
+            <p className="helper-text">
+              Supabase is required for production data. Add keys in `.env` to enable login.
+            </p>
+            <button
+              className="ghost-button full-width demo-login-button"
+              type="button"
+              onClick={() => onLogin(DEMO_USER_EMAIL)}
+            >
+              Continue in Demo Mode
+            </button>
+          </>
         )}
         {message && <p className="notice">{message}</p>}
       </form>
@@ -812,12 +834,34 @@ function AttendanceModule({
   const [staffType, setStaffType] = React.useState<StaffType>('New Staff');
   const [staffEditId, setStaffEditId] = React.useState<string | null>(null);
   const [attendanceEditId, setAttendanceEditId] = React.useState<string | null>(null);
-  const [attendance, setAttendance] = React.useState({
-    date: today,
-    staffId: '',
-    status: 'Present' as AttendanceStatus,
-  });
+  const [bulkDate, setBulkDate] = React.useState(today);
+  const [bulkStatus, setBulkStatus] = React.useState<AttendanceStatus>('Present');
+  const [selectedStaffIds, setSelectedStaffIds] = React.useState<string[]>([]);
   const currentMonth = today.slice(0, 7);
+  const activeStaff = state.staff.filter((staff) => staff.active || selectedStaffIds.includes(staff.id));
+
+  function resetAttendanceForm() {
+    setAttendanceEditId(null);
+    setBulkDate(today);
+    setBulkStatus('Present');
+    setSelectedStaffIds([]);
+  }
+
+  function toggleStaffSelection(staffId: string) {
+    if (attendanceEditId) {
+      setSelectedStaffIds([staffId]);
+      return;
+    }
+
+    setSelectedStaffIds((previous) =>
+      previous.includes(staffId) ? previous.filter((id) => id !== staffId) : [...previous, staffId],
+    );
+  }
+
+  function selectAllStaff() {
+    if (attendanceEditId) return;
+    setSelectedStaffIds(activeStaff.map((staff) => staff.id));
+  }
 
   function addStaff(event: React.FormEvent) {
     event.preventDefault();
@@ -832,32 +876,59 @@ function AttendanceModule({
     setStaffEditId(null);
   }
 
-  function markAttendance(event: React.FormEvent) {
+  function markBulkAttendance(event: React.FormEvent) {
     event.preventDefault();
-    const staff = state.staff.find((person) => person.id === attendance.staffId);
-    if (!staff) return;
+    if (selectedStaffIds.length === 0) return;
 
-    setState((previous) => ({
-      ...previous,
-      attendance: attendanceEditId
-        ? updateList(previous.attendance, attendanceEditId, {
-            date: attendance.date,
-            staffId: attendance.staffId,
-            status: attendance.status,
-            dailyRate: staff.dailyRate,
-          })
-        : [
-            ...previous.attendance,
-            {
-              id: createId('att'),
-              date: attendance.date,
-              staffId: attendance.staffId,
-              status: attendance.status,
+    setState((previous) => {
+      let nextAttendance = [...previous.attendance];
+
+      if (attendanceEditId) {
+        const existing = nextAttendance.find((record) => record.id === attendanceEditId);
+        const staffId = selectedStaffIds[0] ?? existing?.staffId;
+        const staff = previous.staff.find((person) => person.id === staffId);
+        if (!staff || !existing) return previous;
+
+        nextAttendance = updateList(nextAttendance, attendanceEditId, {
+          date: bulkDate,
+          staffId,
+          status: bulkStatus,
+          dailyRate: staff.dailyRate,
+        });
+      } else {
+        selectedStaffIds.forEach((staffId) => {
+          const staff = previous.staff.find((person) => person.id === staffId);
+          if (!staff) return;
+
+          const existing = nextAttendance.find(
+            (record) => record.staffId === staffId && record.date === bulkDate,
+          );
+
+          if (existing) {
+            nextAttendance = updateList(nextAttendance, existing.id, {
+              status: bulkStatus,
               dailyRate: staff.dailyRate,
-            },
-          ],
-    }));
-    setAttendanceEditId(null);
+            });
+          } else {
+            nextAttendance.push({
+              id: createId('att'),
+              date: bulkDate,
+              staffId,
+              status: bulkStatus,
+              dailyRate: staff.dailyRate,
+            });
+          }
+        });
+      }
+
+      return { ...previous, attendance: nextAttendance };
+    });
+
+    if (!attendanceEditId) {
+      setSelectedStaffIds([]);
+    } else {
+      resetAttendanceForm();
+    }
   }
 
   const salaryRows = state.staff.map((staff) => {
@@ -926,8 +997,7 @@ function AttendanceModule({
         </article>
       </section>
 
-      <section className="two-column">
-        <form className="entry-form" onSubmit={addStaff}>
+      <form className="entry-form" onSubmit={addStaff}>
           <h3>{staffEditId ? 'Edit Staff' : 'Add New Staff'}</h3>
           <label>
             Staff Name
@@ -958,61 +1028,88 @@ function AttendanceModule({
           )}
         </form>
 
-        <form className="entry-form" onSubmit={markAttendance}>
-          <h3>{attendanceEditId ? 'Correct Attendance' : 'Mark Attendance'}</h3>
+      <form className="entry-form bulk-attendance-form" onSubmit={markBulkAttendance}>
+        <div className="bulk-attendance-header">
+          <h3>{attendanceEditId ? 'Correct Attendance' : 'Bulk Mark Attendance'}</h3>
+          <p>
+            {attendanceEditId
+              ? 'Update the selected record below.'
+              : 'Select one or more staff members, choose a date and status, then save in one step.'}
+          </p>
+        </div>
+        <div className="bulk-attendance-controls">
           <label>
             Date
             <input
               type="date"
-              value={attendance.date}
-              onChange={(event) => setAttendance({ ...attendance, date: event.target.value })}
+              value={bulkDate}
+              onChange={(event) => setBulkDate(event.target.value)}
             />
-          </label>
-          <label>
-            Staff Name
-            <select
-              value={attendance.staffId}
-              onChange={(event) => setAttendance({ ...attendance, staffId: event.target.value })}
-              required
-            >
-              <option value="">Select staff</option>
-              {state.staff.filter((staff) => staff.active || staff.id === attendance.staffId).map((staff) => (
-                <option value={staff.id} key={staff.id}>
-                  {staff.name}
-                </option>
-              ))}
-            </select>
           </label>
           <label>
             Status
             <select
-              value={attendance.status}
-              onChange={(event) =>
-                setAttendance({ ...attendance, status: event.target.value as AttendanceStatus })
-              }
+              value={bulkStatus}
+              onChange={(event) => setBulkStatus(event.target.value as AttendanceStatus)}
             >
               <option>Present</option>
               <option>Absent</option>
               <option>Half Day</option>
             </select>
           </label>
-          <button className="primary-button" type="submit">
-            {attendanceEditId ? 'Update Attendance' : 'Save Attendance'}
-          </button>
-          {attendanceEditId && (
-            <button
-              className="ghost-button full-width"
-              type="button"
-              onClick={() => {
-                setAttendanceEditId(null);
-                setAttendance({ date: today, staffId: '', status: 'Present' });
-              }}
-            >
-              Cancel Correction
-            </button>
+        </div>
+        {!attendanceEditId && (
+          <div className="bulk-attendance-toolbar">
+            <span>{selectedStaffIds.length} of {activeStaff.length} selected</span>
+            <div className="bulk-attendance-actions">
+              <button className="ghost-button" type="button" onClick={selectAllStaff}>
+                Select All
+              </button>
+              <button className="ghost-button" type="button" onClick={() => setSelectedStaffIds([])}>
+                Clear
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="bulk-attendance-list">
+          {activeStaff.length === 0 ? (
+            <p className="helper-text">Add staff members before marking attendance.</p>
+          ) : (
+            activeStaff.map((staff) => {
+              const existing = state.attendance.find(
+                (record) => record.staffId === staff.id && record.date === bulkDate,
+              );
+              const checked = selectedStaffIds.includes(staff.id);
+
+              return (
+                <label
+                  key={staff.id}
+                  className={`bulk-attendance-item${checked ? ' selected' : ''}${existing ? ' marked' : ''}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleStaffSelection(staff.id)}
+                  />
+                  <span className="bulk-attendance-name">{staff.name}</span>
+                  <span className="bulk-attendance-meta">{staff.type}</span>
+                  {existing && <span className="status-pill">{existing.status}</span>}
+                </label>
+              );
+            })
           )}
-        </form>
-      </section>
+        </div>
+        <button className="primary-button" type="submit" disabled={selectedStaffIds.length === 0}>
+          {attendanceEditId
+            ? 'Update Attendance'
+            : `Save Attendance (${selectedStaffIds.length})`}
+        </button>
+        {attendanceEditId && (
+          <button className="ghost-button full-width" type="button" onClick={resetAttendanceForm}>
+            Cancel Correction
+          </button>
+        )}
+      </form>
 
       <section className="entry-layout single">
         <DataTable
@@ -1026,7 +1123,9 @@ function AttendanceModule({
           ]}
           onEdit={(row) => {
             setAttendanceEditId(row.id);
-            setAttendance({ date: row.date, staffId: row.staffId, status: row.status });
+            setBulkDate(row.date);
+            setBulkStatus(row.status);
+            setSelectedStaffIds([row.staffId]);
           }}
           onDelete={(id) => {
             if (!window.confirm('Remove this attendance record permanently?')) return;
@@ -2256,7 +2355,12 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    if (!userEmail || !supabase) return;
+    if (!userEmail) return;
+
+    if (!isSupabaseConfigured) {
+      setState(seedState);
+      return;
+    }
 
     setLoading(true);
     setError('');
@@ -2270,9 +2374,11 @@ function App() {
     (action) => {
       setState((previous) => {
         const next = typeof action === 'function' ? action(previous) : action;
-        persistStateChanges(previous, next).catch((saveError: Error) => {
-          setError(saveError.message);
-        });
+        if (isSupabaseConfigured) {
+          persistStateChanges(previous, next).catch((saveError: Error) => {
+            setError(saveError.message);
+          });
+        }
         return next;
       });
     },
